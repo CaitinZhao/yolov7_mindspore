@@ -1762,6 +1762,232 @@ class BuildTargetNp(nn.Cell):
         return matching_bs, matching_as, matching_gjs, matching_gis, matching_targets, matching_anchs
 
 
+class BuildTarget(nn.Cell):
+    """
+    Update parameters.
+    Args:
+        anchors (Tensor): anchors in config
+        na (int): channel numbers
+        bias (float): bias in find positive
+        stride (list): stride list of YOLO out's feature
+        anchor_t (float): anchor_t thr
+    Inputs:
+        p (list(Tensor)): predicts(layer_num, anchors_num, feature_size_h, feature_size_w, class_num+1+4).
+                    1 is positive object predict, 4 is x, y, w, h
+        targets (Tensor): targets(target_num, 6). 6 is image_index, cls_id, x, y, w, h
+        img (Tensor): input image
+    """
+
+    def __init__(self, anchors, na=3, bias=0.5, stride=[8, 16, 32], anchor_t=4):
+        super(BuildTarget, self).__init__()
+        if isinstance(anchors, ms.Tensor):
+            anchors = anchors.asnumpy()
+        self.anchors = anchors
+        self.na = na
+        self.bias = bias
+        self.stride = stride
+        self.anchor_t = anchor_t
+        self.off = ms.Tensor(np.array(
+            [
+                [0, 0],
+                [1, 0],
+                [0, 1],
+                [-1, 0],
+                [0, -1],  # j,k,l,m
+            ],
+            dtype=np.float32) * bias)  # offsets
+        self.binary_cross_entropy_with_logits = nn.BCEWithLogitsLoss(reduction="none")
+
+    def find_3_positive(self, outputs, targets, all_anchors):
+        # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
+        na, nt = self.na, targets.shape[0]  # number of anchors, targets
+        indices, anch = [], []
+        gain = ops.ones(7, type=ms.float32)  # normalized to gridspace gain
+        ai = ops.arange(0, na, dtype=ms.float32).view(na, 1).tile((1, nt))  # same as .repeat_interleave(nt)
+        targets = ops.concat((targets.tile((na, 1, 1)), ai[:, :, None]), 2)  # append anchor indices
+
+        for i in range(self.nl):
+            anchors = all_anchors[i]
+            gain[2:6] = get_tensor(outputs[i].shape)[[3, 2, 3, 2]]  # xyxy gain
+
+            # Match targets to anchors
+            t = targets * gain
+            if nt:
+                # Matches
+                r = t[:, :, 4:6] / anchors[:, None]  # wh ratio
+                j = ops.maximum(r, 1. / r).max(2)[0] < self.hyp['anchor_t']  # compare
+                # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n)=wh_iou(anchors(3,2), gwh(n,2))
+                t = t[j]  # filter
+
+                # Offsets
+                gxy = t[:, 2:4]  # grid xy
+                gxi = gain[[2, 3]] - gxy  # inverse
+                j, k = ((gxy % 1. < self.bias) & (gxy > 1.)).T
+                l, m = ((gxi % 1. < self.bias) & (gxi > 1.)).T
+                j = ops.stack((ops.ones_like(j), (j, k, l, m)))
+                t = t.tail((5, 1, 1))[j]
+                offsets = (ops.zeros_like(gxy)[None] + self.off[:, None])[j]
+            else:
+                t = targets[0]
+                offsets = 0
+
+            # Define
+            b, c = t[:, :2].long().T  # image, class
+            gxy = t[:, 2:4]  # grid xy
+            gwh = t[:, 4:6]  # grid wh
+            gij = (gxy - offsets).long()
+            gi, gj = gij.T  # grid xy indices
+
+            # Append
+            a = t[:, 6].long()  # anchor indices
+            indices.append((b, a, gj.clip(0, gain[3] - 1), gi.clip(0, gain[2] - 1)))  # image, anchor, grid indices
+            anch.append(anchors[a])  # anchors
+
+        return indices, anch
+
+    def construct(self, p, targets, imgs):
+        # indices, anch = self.find_positive(p, targets)
+        indices, anch = self.find_3_positive(p, targets)
+        # indices, anch = self.find_4_positive(p, targets)
+        # indices, anch = self.find_5_positive(p, targets)
+        # indices, anch = self.find_9_positive(p, targets)
+        matching_bs = [[] for pp in p]
+        matching_as = [[] for pp in p]
+        matching_gjs = [[] for pp in p]
+        matching_gis = [[] for pp in p]
+        matching_targets = [[] for pp in p]
+        matching_anchs = [[] for pp in p]
+
+        nl = len(p)
+        for batch_idx in range(p[0].shape[0]):
+            b_idx = targets[:, 0] == batch_idx
+            this_target = targets[b_idx]
+            if this_target.shape[0] == 0:
+                continue
+
+            txywh = this_target[:, 2:6] * imgs[batch_idx].shape[1]
+            txyxy = xywh2xyxy(txywh)
+
+            pxyxys, p_cls, p_obj = [], [], []
+            from_which_layer = []
+            all_b, all_a, all_gj, all_gi = [], [], [], []
+            all_anch = []
+
+            for i, pi in enumerate(p):
+                b, a, gj, gi = indices[i]
+                idx = (b == batch_idx)
+                b, a, gj, gi = b[idx], a[idx], gj[idx], gi[idx]
+                all_b.append(b)
+                all_a.append(a)
+                all_gj.append(gj)
+                all_gi.append(gi)
+                all_anch.append(anch[i][idx])
+                from_which_layer.append((ops.ones((len(b),), ms.int32) * i))
+
+                fg_pred = pi[b, a, gj, gi]
+                p_obj.append(fg_pred[:, 4:5])
+                p_cls.append(fg_pred[:, 5:])
+
+                grid = ops.stack([gi, gj], axis=1)
+                pxy = (fg_pred[:, :2].sigmoid() * 2. - 0.5 + grid) * self.stride[i]  # / 8.
+                # pxy = (fg_pred[:, :2].sigmoid() * 3. - 1. + grid) * self.stride[i]
+                pwh = (fg_pred[:, 2:4].sigmoid() * 2) ** 2 * anch[i][idx] * self.stride[i]  # / 8.
+                pxywh = ops.concat((pxy, pwh), axis=-1)
+                pxyxy = xywh2xyxy(pxywh)
+                pxyxys.append(pxyxy)
+
+            pxyxys = ops.concat(pxyxys, axis=0)
+            if pxyxys.shape[0] == 0:
+                continue
+            p_obj = ops.concat(p_obj, axis=0)
+            p_cls = ops.concat(p_cls, axis=0)
+            from_which_layer = ops.concat(from_which_layer, axis=0)
+            all_b = ops.concat(all_b, axis=0)
+            all_a = ops.concat(all_a, axis=0)
+            all_gj = ops.concat(all_gj, axis=0)
+            all_gi = ops.concat(all_gi, axis=0)
+            all_anch = ops.concat(all_anch, axis=0)
+
+            pair_wise_iou = box_iou(txyxy, pxyxys)
+
+            pair_wise_iou_loss = -ops.log(pair_wise_iou + 1e-8)
+
+            top_k, _ = ops.top_k(pair_wise_iou, min(10, pair_wise_iou.shape[1]))
+            dynamic_ks = ops.minimum(top_k.sum(1), 1)
+
+            gt_cls_per_image = (
+                ops.one_hot(this_target[:, 1], self.nc, ms.Tensor(1), ms.Tensor(0))
+                    .unsqueeze(1)
+                    .tile((1, pxyxys.shape[0], 1))
+            )
+
+            num_gt = this_target.shape[0]
+            cls_preds_ = (
+                    p_cls.astype(ms.float32).unsqueeze(0).tile((num_gt, 1, 1)).sigmoid()
+                    * p_obj.unsqueeze(0).tile((num_gt, 1, 1)).sigmoid()
+            )
+
+            y = ops.sqrt(cls_preds_)
+            pair_wise_cls_loss = self.binary_cross_entropy_with_logits(
+                ops.log(y / (1 - y)), gt_cls_per_image).sum(-1)
+
+            cost = (
+                    pair_wise_cls_loss
+                    + 3.0 * pair_wise_iou_loss
+            )
+
+            matching_matrix = ops.zeros_like(cost)
+
+            for gt_idx in range(num_gt):
+                _, pos_idx = ops.top_k(
+                    cost[gt_idx], k=dynamic_ks[gt_idx]
+                )
+                matching_matrix[gt_idx][pos_idx] = 1.0
+            anchor_matching_gt = matching_matrix.sum(0)
+            if (anchor_matching_gt > 1).sum() > 0:
+                _, cost_argmin = ops.reduce_min(cost[:, anchor_matching_gt > 1], axis=0)
+                matching_matrix[:, anchor_matching_gt > 1] *= 0.0
+                matching_matrix[cost_argmin, anchor_matching_gt > 1] = 1.0
+            fg_mask_inboxes = (matching_matrix.sum(0) > 0.0)
+            matched_gt_inds = matching_matrix[:, fg_mask_inboxes].argmax(0)
+
+            from_which_layer = from_which_layer[fg_mask_inboxes]
+            all_b = all_b[fg_mask_inboxes]
+            all_a = all_a[fg_mask_inboxes]
+            all_gj = all_gj[fg_mask_inboxes]
+            all_gi = all_gi[fg_mask_inboxes]
+            all_anch = all_anch[fg_mask_inboxes]
+
+            this_target = this_target[matched_gt_inds]
+
+            for i in range(nl):
+                layer_idx = from_which_layer == i
+                matching_bs[i].append(all_b[layer_idx])
+                matching_as[i].append(all_a[layer_idx])
+                matching_gjs[i].append(all_gj[layer_idx])
+                matching_gis[i].append(all_gi[layer_idx])
+                matching_targets[i].append(this_target[layer_idx])
+                matching_anchs[i].append(all_anch[layer_idx])
+
+        for i in range(nl):
+            if matching_targets[i] != []:
+                matching_bs[i] = ops.concat(matching_bs[i], axis=0)
+                matching_as[i] = ops.concat(matching_as[i], axis=0)
+                matching_gjs[i] = ops.concat(matching_gjs[i], axis=0)
+                matching_gis[i] = ops.concat(matching_gis[i], axis=0)
+                matching_targets[i] = ops.concat(matching_targets[i], axis=0)
+                matching_anchs[i] = ops.concat(matching_anchs[i], axis=0)
+            else:
+                matching_bs[i] = ms.Tensor.from_numpy(np.array([]).astype(np.int32))
+                matching_as[i] = ms.Tensor.from_numpy(np.array([]).astype(np.int32))
+                matching_gjs[i] = ms.Tensor.from_numpy(np.array([]).astype(np.int32))
+                matching_gis[i] = ms.Tensor.from_numpy(np.array([]).astype(np.int32))
+                matching_targets[i] = ms.Tensor.from_numpy(np.array([]).astype(np.int32))
+                matching_anchs[i] = ms.Tensor.from_numpy(np.array([]).astype(np.int32))
+
+        return matching_bs, matching_as, matching_gjs, matching_gis, matching_targets, matching_anchs
+
+
 class ComputeLossAuxOTA_dynamic(nn.Cell):
     # run with mindspore version 2.0.0
     def __init__(self, model, autobalance=False):
