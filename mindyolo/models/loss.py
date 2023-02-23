@@ -1467,6 +1467,8 @@ class BuildTargetNp(nn.Cell):
         super(BuildTargetNp, self).__init__()
         if isinstance(anchors, ms.Tensor):
             anchors = anchors.asnumpy()
+        if isinstance(stride, ms.Tensor):
+            stride = stride.asnumpy()
         self.anchors = anchors
         self.na = na
         self.bias = bias

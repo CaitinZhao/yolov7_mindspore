@@ -10,6 +10,7 @@ import mindspore as ms
 from mindspore.context import ParallelMode
 from mindspore import context, nn, ops, Tensor
 from mindspore.communication.management import init, get_rank, get_group_size
+from mindspore.amp import init_status, all_finite
 
 from mindyolo.models.yolo import Model
 from mindyolo.models import EMA
@@ -398,7 +399,6 @@ def create_train_static_shape_cell(model, optimizer, rank_size=8, amp_level="O2"
 def create_train_static_shape_fn(model, optimizer, loss_scaler, grad_reducer=None, rank_size=8,
                                  amp_level="O2", overflow_still_update=False):
     # from mindspore.amp import all_finite # Bugs before MindSpore 1.9.0
-    from mindyolo.utils.all_finite import all_finite
     if loss_scaler is None:
         from mindspore.amp import StaticLossScaler
         loss_scaler = StaticLossScaler(1.0)
@@ -429,10 +429,11 @@ def create_train_static_shape_fn(model, optimizer, loss_scaler, grad_reducer=Non
 
     @ms.ms_function
     def train_step(x, label, sizes=None, optimizer_update=True):
+        status = init_status()
         (loss, loss_items), grads = grad_fn(x, label, sizes)
         grads = grad_reducer(grads)
         unscaled_grads = loss_scaler.unscale(grads)
-        grads_finite = all_finite(unscaled_grads)
+        grads_finite = all_finite(unscaled_grads, status)
         # _ = loss_scaler.adjust(grads_finite)
 
         if optimizer_update:
@@ -452,7 +453,6 @@ def create_train_static_shape_fn(model, optimizer, loss_scaler, grad_reducer=Non
 def create_train_static_shape_fn_gradoperation(model, optimizer, loss_scaler, grad_reducer=None, rank_size=8,
                                                amp_level="O2", overflow_still_update=False, sens=1.0):
     # from mindspore.amp import all_finite # Bugs before MindSpore 1.9.0
-    from mindyolo.utils.all_finite import all_finite
     if loss_scaler is None:
         from mindspore.amp import StaticLossScaler
         loss_scaler = StaticLossScaler(sens)
@@ -491,13 +491,14 @@ def create_train_static_shape_fn_gradoperation(model, optimizer, loss_scaler, gr
 
     @ms.ms_function
     def train_step(x, label, sizes=None, optimizer_update=True):
+        status = init_status()
         loss, loss_items = forward_func(x, label, sizes)
         sens1, sens2 = ops.fill(loss.dtype, loss.shape, sens_value), \
                        ops.fill(loss_items.dtype, loss_items.shape, sens_value)
         grads = grad_fn(x, label, sizes, (sens1, sens2))
         grads = grad_reducer(grads)
         grads = loss_scaler.unscale(grads)
-        grads_finite = all_finite(grads)
+        grads_finite = all_finite(grads, status)
 
         if optimizer_update:
             if grads_finite:
@@ -517,7 +518,6 @@ def create_train_static_shape_fn_gradoperation(model, optimizer, loss_scaler, gr
 def create_train_dynamic_shape_fn(model, optimizer, loss_scaler, grad_reducer=None, rank_size=8,
                                   amp_level="O2"):
     # from mindspore.amp import all_finite # Bugs before MindSpore 1.9.0
-    from mindyolo.utils.all_finite import all_finite
     # Def train func
     # use_ota = opt.loss_ota
     use_ota = opt.loss_ota
@@ -550,10 +550,11 @@ def create_train_dynamic_shape_fn(model, optimizer, loss_scaler, grad_reducer=No
     grad_fn = ops.value_and_grad(forward_func, grad_position=None, weights=optimizer.parameters, has_aux=True)
 
     def train_step(x, label, sizes=None, optimizer_update=True):
+        status = init_status()
         (loss, loss_items), grads = grad_fn(x, label, sizes)
         grads = grad_reducer(grads)
         unscaled_grads = loss_scaler.unscale(grads)
-        grads_finite = all_finite(unscaled_grads)
+        grads_finite = all_finite(unscaled_grads, status)
         # _ = loss_scaler.adjust(grads_finite)
 
         if optimizer_update:
