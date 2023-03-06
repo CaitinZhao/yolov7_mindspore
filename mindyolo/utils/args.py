@@ -3,8 +3,8 @@ import ast
 
 def get_args_train(parents=None):
     parser = argparse.ArgumentParser(description='Train', parents=[parents] if parents else [])
-    parser.add_argument('--ms_strategy', type=str, default='StaticShape', help='train strategy, StaticCell/StaticShape/MultiShape/DynamicShape')
-    parser.add_argument('--ms_mode', type=int, default=0, help='Running in GRAPH_MODE(0) or PYNATIVE_MODE(1) (default=0)')
+    parser.add_argument('--ms_strategy', type=str, default='DynamicShape', help='train strategy, StaticCell/StaticShape/MultiShape/DynamicShape')
+    parser.add_argument('--ms_mode', type=int, default=1, help='Running in GRAPH_MODE(0) or PYNATIVE_MODE(1) (default=0)')
     parser.add_argument('--ms_amp_level', type=str, default='O0', help='amp level, O0/O1/O2')
     parser.add_argument('--ms_loss_scaler', type=str, default='static', help='train loss scaler, static/dynamic/none')
     parser.add_argument('--ms_loss_scaler_value', type=float, default=1024.0, help='static loss scale value')

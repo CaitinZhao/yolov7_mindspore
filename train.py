@@ -10,10 +10,11 @@ import mindspore as ms
 from mindspore.context import ParallelMode
 from mindspore import context, nn, ops, Tensor
 from mindspore.communication.management import init, get_rank, get_group_size
+from mindspore.amp import init_status, all_finite
 
 from mindyolo.models.yolo import Model
 from mindyolo.models import EMA
-from mindyolo.models.loss import ComputeLoss, ComputeLossOTA, ComputeLossAuxOTA, ComputeLossOTA_dynamic, ComputeLossAuxOTA_dynamic
+from mindyolo.models.loss import ComputeLoss, ComputeLossOTA, ComputeLossOTA_dynamic
 from mindyolo.utils.optimizer import get_group_param_yolov7, get_lr_yolov7
 from mindyolo.utils.dataset import create_dataloader
 from mindyolo.utils.general import increment_path, colorstr, check_img_size
@@ -398,7 +399,6 @@ def create_train_static_shape_cell(model, optimizer, rank_size=8, amp_level="O2"
 def create_train_static_shape_fn(model, optimizer, loss_scaler, grad_reducer=None, rank_size=8,
                                  amp_level="O2", overflow_still_update=False):
     # from mindspore.amp import all_finite # Bugs before MindSpore 1.9.0
-    from mindyolo.utils.all_finite import all_finite
     if loss_scaler is None:
         from mindspore.amp import StaticLossScaler
         loss_scaler = StaticLossScaler(1.0)
@@ -429,10 +429,11 @@ def create_train_static_shape_fn(model, optimizer, loss_scaler, grad_reducer=Non
 
     @ms.ms_function
     def train_step(x, label, sizes=None, optimizer_update=True):
+        status = init_status()
         (loss, loss_items), grads = grad_fn(x, label, sizes)
         grads = grad_reducer(grads)
         unscaled_grads = loss_scaler.unscale(grads)
-        grads_finite = all_finite(unscaled_grads)
+        grads_finite = all_finite(unscaled_grads, status)
         # _ = loss_scaler.adjust(grads_finite)
 
         if optimizer_update:
@@ -452,7 +453,6 @@ def create_train_static_shape_fn(model, optimizer, loss_scaler, grad_reducer=Non
 def create_train_static_shape_fn_gradoperation(model, optimizer, loss_scaler, grad_reducer=None, rank_size=8,
                                                amp_level="O2", overflow_still_update=False, sens=1.0):
     # from mindspore.amp import all_finite # Bugs before MindSpore 1.9.0
-    from mindyolo.utils.all_finite import all_finite
     if loss_scaler is None:
         from mindspore.amp import StaticLossScaler
         loss_scaler = StaticLossScaler(sens)
@@ -463,7 +463,7 @@ def create_train_static_shape_fn_gradoperation(model, optimizer, loss_scaler, gr
         if not use_aux:
             compute_loss = ComputeLossOTA(model)  # init loss class
         else:
-            compute_loss = ComputeLossAuxOTA(model) # init loss class
+            compute_loss = ComputeLossOTA(model) # init loss class
     else:
         if not use_aux:
             compute_loss = ComputeLoss(model)  # init loss class
@@ -491,13 +491,14 @@ def create_train_static_shape_fn_gradoperation(model, optimizer, loss_scaler, gr
 
     @ms.ms_function
     def train_step(x, label, sizes=None, optimizer_update=True):
+        status = init_status()
         loss, loss_items = forward_func(x, label, sizes)
         sens1, sens2 = ops.fill(loss.dtype, loss.shape, sens_value), \
                        ops.fill(loss_items.dtype, loss_items.shape, sens_value)
         grads = grad_fn(x, label, sizes, (sens1, sens2))
         grads = grad_reducer(grads)
         grads = loss_scaler.unscale(grads)
-        grads_finite = all_finite(grads)
+        grads_finite = all_finite(grads, status)
 
         if optimizer_update:
             if grads_finite:
@@ -517,7 +518,6 @@ def create_train_static_shape_fn_gradoperation(model, optimizer, loss_scaler, gr
 def create_train_dynamic_shape_fn(model, optimizer, loss_scaler, grad_reducer=None, rank_size=8,
                                   amp_level="O2"):
     # from mindspore.amp import all_finite # Bugs before MindSpore 1.9.0
-    from mindyolo.utils.all_finite import all_finite
     # Def train func
     # use_ota = opt.loss_ota
     use_ota = opt.loss_ota
@@ -526,7 +526,7 @@ def create_train_dynamic_shape_fn(model, optimizer, loss_scaler, grad_reducer=No
         if not use_aux:
             compute_loss = ComputeLossOTA_dynamic(model)  # init loss class
         else:
-            compute_loss = ComputeLossAuxOTA_dynamic(model) # init loss class
+            compute_loss = ComputeLossOTA_dynamic(model) # init loss class
     else:
         raise NotImplementedError
 
@@ -550,10 +550,12 @@ def create_train_dynamic_shape_fn(model, optimizer, loss_scaler, grad_reducer=No
     grad_fn = ops.value_and_grad(forward_func, grad_position=None, weights=optimizer.parameters, has_aux=True)
 
     def train_step(x, label, sizes=None, optimizer_update=True):
+        status = init_status()
         (loss, loss_items), grads = grad_fn(x, label, sizes)
         grads = grad_reducer(grads)
+        loss = loss_scaler.unscale(loss)
         unscaled_grads = loss_scaler.unscale(grads)
-        grads_finite = all_finite(unscaled_grads)
+        grads_finite = all_finite(unscaled_grads, status)
         # _ = loss_scaler.adjust(grads_finite)
 
         if optimizer_update:
@@ -577,9 +579,9 @@ if __name__ == '__main__':
     opt.save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok)  # increment run
 
     context.set_context(mode=opt.ms_mode, device_target=opt.device_target, max_call_depth=2000)
-    if opt.device_target == "Ascend":
-        device_id = int(os.getenv('DEVICE_ID', 0))
-        context.set_context(device_id=device_id)
+
+    device_id = int(os.getenv('DEVICE_ID', 0))
+    context.set_context(device_id=device_id)
     # context.set_context(pynative_synchronize=True)
     # if opt.device_target == "GPU":
     #    context.set_context(enable_graph_kernel=True)

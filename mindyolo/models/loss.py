@@ -108,14 +108,14 @@ def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7
 
     # Get the coordinates of bounding boxes
     if xywh:  # transform from xywh to xyxy
-        x1, y1, w1, h1 = ops.split(box1, 1, 4)
-        x2, y2, w2, h2 = ops.split(box2, 1, 4)
+        x1, y1, w1, h1 = ops.Split(1, 4)(box1)
+        x2, y2, w2, h2 = ops.Split(1, 4)(box2)
         w1_, h1_, w2_, h2_ = w1 / 2, h1 / 2, w2 / 2, h2 / 2
         b1_x1, b1_x2, b1_y1, b1_y2 = x1 - w1_, x1 + w1_, y1 - h1_, y1 + h1_
         b2_x1, b2_x2, b2_y1, b2_y2 = x2 - w2_, x2 + w2_, y2 - h2_, y2 + h2_
     else:  # x1, y1, x2, y2 = box1
-        b1_x1, b1_y1, b1_x2, b1_y2 = ops.split(box1, 1, 4)
-        b2_x1, b2_y1, b2_x2, b2_y2 = ops.split(box2, 1, 4)
+        b1_x1, b1_y1, b1_x2, b1_y2 = ops.Split(1, 4)(box1)
+        b2_x1, b2_y1, b2_x2, b2_y2 = ops.Split(1, 4)(box2)
         # w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1
         # w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1
 
@@ -508,6 +508,7 @@ class ComputeLossOTA(nn.Cell):
         for i in range(self.nl): # layer index
             pi = p[i] # layer predictions
             b, a, gj, gi, tmask = bs[i], as_[i], gjs[i], gis[i], tmasks[i]  # image, anchor, gridy, gridx, tmask
+            print((tmask.asnumpy() > 0.5).sum())
             tobj = ops.zeros_like(pi[..., 0])  # target obj
 
             n = b.shape[0]  # number of targets
@@ -585,7 +586,7 @@ class ComputeLossOTA(nn.Cell):
             _this_indices *= _this_mask[None, :]
             _this_anch *= _this_mask[:, None]
 
-            b, a, gj, gi = ops.split(_this_indices, 0, 4)
+            b, a, gj, gi = ops.Split(0, 4)(_this_indices)
             b, a, gj, gi = b.view(-1), a.view(-1), \
                            gj.view(-1), gi.view(-1)
 
@@ -628,7 +629,7 @@ class ComputeLossOTA(nn.Cell):
         pair_wise_iou = batch_box_iou(txyxy, pxyxys) * this_mask  # (bs, gt_max, nl*5*na*gt_max,)
         pair_wise_iou_loss = -ops.log(pair_wise_iou + EPS)
 
-        v, _ = ops.top_k(pair_wise_iou, 10) # (bs, gt_max, 10)
+        v, _ = ops.topk(pair_wise_iou, 10) # (bs, gt_max, 10)
         dynamic_ks = ops.cast(v.sum(-1).clip(1, 10), ms.int32) # (bs, gt_max)
 
         # (bs, gt_max, 80)
@@ -656,7 +657,7 @@ class ComputeLossOTA(nn.Cell):
         cost = cost * this_mask
         cost += CLIP_VALUE * (1.0 - ops.cast(this_mask, cost.dtype))
 
-        sort_cost, sort_idx = ops.top_k(-cost, 10, sorted=True) # (bs, gt_max, 10)
+        sort_cost, sort_idx = ops.topk(-cost, 10, sorted=True) # (bs, gt_max, 10)
         sort_cost = -sort_cost
         pos_idx = ops.stack((mnp.arange(batch_size * n_gt_max), dynamic_ks.view(-1) - 1), -1)
         pos_v = ops.gather_nd(sort_cost.view(batch_size * n_gt_max, 10), pos_idx).view(batch_size, n_gt_max)
@@ -674,7 +675,8 @@ class ComputeLossOTA(nn.Cell):
         all_tmasks = all_tmasks * ops.cast(fg_mask_inboxes, ms.int32) # (bs, nl*5*na*gt_max)
         matched_gt_inds = matching_matrix.argmax(1) # (bs, gt_max, nl*5*na*gt_max) -> (bs, nl*5*na*gt_max)
         matched_bs_inds = ops.tile(mnp.arange(batch_size)[:, None], (1, matching_matrix.shape[2]))  # (bs, nl*5*na*gt_max)
-        matched_inds = ops.stack((matched_bs_inds.view(-1), matched_gt_inds.view(-1)), 1)  # (bs*nl*5*na*gt_max, 2)
+        matched_inds = ops.stack((matched_bs_inds.view(-1).astype(ms.int32),
+                                  matched_gt_inds.view(-1).astype(ms.int32)), 1)  # (bs*nl*5*na*gt_max, 2)
         # zhy_test
         matched_inds *= all_tmasks.view(-1)[:, None]
         this_target = ops.gather_nd(this_target, matched_inds)  # (bs*nl*5*na*gt_max, 6)
@@ -950,7 +952,7 @@ class ComputeLossAuxOTA(nn.Cell):
             _this_indices *= _this_mask[None, :]
             _this_anch *= _this_mask[:, None]
 
-            b, a, gj, gi = ops.split(_this_indices, 0, 4)
+            b, a, gj, gi = ops.Split(0, 4)(_this_indices)
             b, a, gj, gi = b.view(-1), a.view(-1), \
                            gj.view(-1), gi.view(-1)
 
@@ -994,7 +996,7 @@ class ComputeLossAuxOTA(nn.Cell):
         pair_wise_iou_loss = -ops.log(pair_wise_iou + EPS)
 
         # Top 20 iou sum for aux, default 10
-        v, _ = ops.top_k(pair_wise_iou, 20) # (bs, gt_max, 20)
+        v, _ = ops.topk(pair_wise_iou, 20) # (bs, gt_max, 20)
         dynamic_ks = ops.cast(v.sum(-1).clip(1, 20), ms.int32) # (bs, gt_max)
 
         # (bs, gt_max, 80)
@@ -1022,7 +1024,7 @@ class ComputeLossAuxOTA(nn.Cell):
         cost = cost * this_mask
         cost += CLIP_VALUE * (1.0 - ops.cast(this_mask, cost.dtype))
 
-        sort_cost, sort_idx = ops.top_k(-cost, 20, sorted=True) # (bs, gt_max, 20)
+        sort_cost, sort_idx = ops.topk(-cost, 20, sorted=True) # (bs, gt_max, 20)
         sort_cost = -sort_cost
         pos_idx = ops.stack((mnp.arange(batch_size * n_gt_max), dynamic_ks.view(-1) - 1), -1)
         pos_v = ops.gather_nd(sort_cost.view(batch_size * n_gt_max, 20), pos_idx).view(batch_size, n_gt_max)
@@ -1091,7 +1093,7 @@ class ComputeLossAuxOTA(nn.Cell):
             _this_indices *= _this_mask[None, :]
             _this_anch *= _this_mask[:, None]
 
-            b, a, gj, gi = ops.split(_this_indices, 0, 4)
+            b, a, gj, gi = ops.Split(0, 4)(_this_indices)
             b, a, gj, gi = b.view(-1), a.view(-1), \
                            gj.view(-1), gi.view(-1)
 
@@ -1135,7 +1137,7 @@ class ComputeLossAuxOTA(nn.Cell):
         pair_wise_iou_loss = -ops.log(pair_wise_iou + EPS)
 
         # Top 20 iou sum for aux, default 10
-        v, _ = ops.top_k(pair_wise_iou, 20)  # (bs, gt_max, 20)
+        v, _ = ops.topk(pair_wise_iou, 20)  # (bs, gt_max, 20)
         dynamic_ks = ops.cast(v.sum(-1).clip(1, 20), ms.int32)  # (bs, gt_max)
 
         # (bs, gt_max, 80)
@@ -1164,7 +1166,7 @@ class ComputeLossAuxOTA(nn.Cell):
         cost = cost * this_mask
         cost += CLIP_VALUE * (1.0 - ops.cast(this_mask, cost.dtype))
 
-        sort_cost, sort_idx = ops.top_k(-cost, 20, sorted=True)  # (bs, gt_max, 20)
+        sort_cost, sort_idx = ops.topk(-cost, 20, sorted=True)  # (bs, gt_max, 20)
         sort_cost = -sort_cost
         pos_idx = ops.stack((mnp.arange(batch_size * n_gt_max), dynamic_ks.view(-1) - 1), -1)
         pos_v = ops.gather_nd(sort_cost.view(batch_size * n_gt_max, 20), pos_idx).view(batch_size, n_gt_max)
@@ -1532,7 +1534,7 @@ class ComputeLossOTA_dynamic(nn.Cell):
             pair_wise_iou = box_iou(txyxy, pxyxys) # (n_tb, 4), (n_tp, 4) -> (n_tb, n_tp)
             pair_wise_iou_loss = -ops.log(pair_wise_iou + 1e-8)
 
-            v, _ = ops.top_k(pair_wise_iou, min(10, pair_wise_iou.shape[1])) # (n_tb, 10)
+            v, _ = ops.topk(pair_wise_iou, min(10, pair_wise_iou.shape[1])) # (n_tb, 10)
             dynamic_ks = v.sum(1).astype(ms.int32).clip(1, None) # (n_tb,)
 
             gt_cls_per_image = ops.one_hot(indices=ops.cast(this_target[:, 1], ms.int32),
@@ -1562,13 +1564,13 @@ class ComputeLossOTA_dynamic(nn.Cell):
             # 1. dynamic-k match with pynative and dynamic-shape
             matching_matrix = ops.zeros_like(cost)
             for gt_idx in range(num_gt):
-                _, pos_idx = ops.top_k(
+                _, pos_idx = ops.topk(
                     -cost[gt_idx], k=int(dynamic_ks[gt_idx].asnumpy())
                 )
                 matching_matrix[gt_idx][pos_idx] = 1.0
 
             # 2. dynamic-k match with pynative and static-shape
-            # sort_cost, sort_idx = ops.top_k(-cost, 10, sorted=True)
+            # sort_cost, sort_idx = ops.topk(-cost, 10, sorted=True)
             # sort_cost = -sort_cost
             # pos_idx = ops.stack((mnp.arange(cost.shape[0]), dynamic_ks - 1), -1)
             # pos_v = ops.gather_nd(sort_cost, pos_idx)
@@ -1952,7 +1954,7 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
             pair_wise_iou = box_iou(txyxy, pxyxys) # (n_tb, 4), (n_tp, 4) -> (n_tb, n_tp)
             pair_wise_iou_loss = -ops.log(pair_wise_iou + 1e-8)
 
-            v, _ = ops.top_k(pair_wise_iou, min(20, pair_wise_iou.shape[1])) # (n_tb, 10)
+            v, _ = ops.topk(pair_wise_iou, min(20, pair_wise_iou.shape[1])) # (n_tb, 10)
             dynamic_ks = v.sum(1).astype(ms.int32).clip(1, None) # (n_tb,)
 
             gt_cls_per_image = ops.one_hot(indices=ops.cast(this_target[:, 1], ms.int32),
@@ -1982,13 +1984,13 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
             # 1. dynamic-k match with pynative and dynamic-shape
             matching_matrix = ops.zeros_like(cost)
             for gt_idx in range(num_gt):
-                _, pos_idx = ops.top_k(
+                _, pos_idx = ops.topk(
                     -cost[gt_idx], k=int(dynamic_ks[gt_idx].asnumpy())
                 )
                 matching_matrix[gt_idx][pos_idx] = 1.0
 
             # 2. dynamic-k match with pynative and static-shape
-            # sort_cost, sort_idx = ops.top_k(-cost, 10, sorted=True)
+            # sort_cost, sort_idx = ops.topk(-cost, 10, sorted=True)
             # sort_cost = -sort_cost
             # pos_idx = ops.stack((mnp.arange(cost.shape[0]), dynamic_ks - 1), -1)
             # pos_v = ops.gather_nd(sort_cost, pos_idx)
@@ -2150,7 +2152,7 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
             pair_wise_iou = box_iou(txyxy, pxyxys) # (n_tb, 4), (n_tp, 4) -> (n_tb, n_tp)
             pair_wise_iou_loss = -ops.log(pair_wise_iou + 1e-8)
 
-            v, _ = ops.top_k(pair_wise_iou, min(20, pair_wise_iou.shape[1])) # (n_tb, 10)
+            v, _ = ops.topk(pair_wise_iou, min(20, pair_wise_iou.shape[1])) # (n_tb, 10)
             dynamic_ks = v.sum(1).astype(ms.int32).clip(1, None) # (n_tb,)
 
             gt_cls_per_image = ops.one_hot(indices=ops.cast(this_target[:, 1], ms.int32),
@@ -2180,13 +2182,13 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
             # 1. dynamic-k match with pynative and dynamic-shape
             matching_matrix = ops.zeros_like(cost)
             for gt_idx in range(num_gt):
-                _, pos_idx = ops.top_k(
+                _, pos_idx = ops.topk(
                     -cost[gt_idx], k=int(dynamic_ks[gt_idx].asnumpy())
                 )
                 matching_matrix[gt_idx][pos_idx] = 1.0
 
             # 2. dynamic-k match with pynative and static-shape
-            # sort_cost, sort_idx = ops.top_k(-cost, 10, sorted=True)
+            # sort_cost, sort_idx = ops.topk(-cost, 10, sorted=True)
             # sort_cost = -sort_cost
             # pos_idx = ops.stack((mnp.arange(cost.shape[0]), dynamic_ks - 1), -1)
             # pos_v = ops.gather_nd(sort_cost, pos_idx)
